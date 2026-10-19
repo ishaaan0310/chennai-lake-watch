@@ -1,0 +1,262 @@
+XAWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Chennai Lake Watch - tracks the water area of Chennai's lakes from free
+  Sentinel-2 satellite imagery. Serverless, designed for the AWS free plan.
+  Deploy in us-west-2 (Oregon), where the imagery lives.
+
+Parameters:
+  AlertEmail:
+    Type: String
+    Description: Email address for lake-change alerts, failure alarms and budget warnings.
+  MonthlyBudgetUsd:
+    Type: Number
+    Default: 5
+    Description: Monthly cost (USD) at which you get a warning email.
+  AlertChangePct:
+    Type: Number
+    Default: 15
+    Description: Percent change in a lake's water area that triggers an alert.
+
+Resources:
+  # ------------------------------------------------------------ storage
+  LakeTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${AWS::StackName}-observations"
+      AttributeDefinitions:
+        - { AttributeName: lake, AttributeType: S }
+        - { AttributeName: date, AttributeType: S }
+      KeySchema:
+        - { AttributeName: lake, KeyType: HASH }
+        - { AttributeName: date, KeyType: RANGE }
+      # Small provisioned capacity stays inside the always-free DynamoDB tier.
+      BillingMode: PROVISIONED
+      ProvisionedThroughput: { ReadCapacityUnits: 5, WriteCapacityUnits: 5 }
+
+  SiteBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # ------------------------------------------------------------ website
+  SiteOriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "${AWS::StackName}-oac"
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  SiteDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: Chennai Lake Watch
+        DefaultRootObject: index.html
+        HttpVersion: http2and3
+        PriceClass: PriceClass_200
+        Origins:
+          - Id: site
+            DomainName: !GetAtt SiteBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt SiteOriginAccessControl.Id
+            S3OriginConfig: { OriginAccessIdentity: "" }
+        DefaultCacheBehavior:
+          TargetOriginId: site
+          ViewerProtocolPolicy: redirect-to-https
+          Compress: true
+          # AWS managed "CachingOptimized" policy; honours our Cache-Control headers.
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+
+  SiteBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref SiteBucket
+      PolicyDocument:
+        Statement:
+          - Sid: AllowCloudFrontRead
+            Effect: Allow
+            Principal: { Service: cloudfront.amazonaws.com }
+            Action: s3:GetObject
+            Resource: !Sub "${SiteBucket.Arn}/*"
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${SiteDistribution}"
+
+  # ------------------------------------------------------------ alerts
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: Lake Watch
+
+  AlertSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref AlertTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  # ------------------------------------------------------------ pipeline
+  PipelineLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-pipeline"
+      RetentionInDays: 14
+
+  PipelineFunction:
+    Type: AWS::Serverless::Function
+    DependsOn: PipelineLogGroup
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-pipeline"
+      Description: Finds new Sentinel-2 scenes and measures lake water area (NDWI).
+      CodeUri: build/
+      Handler: handler.lambda_handler
+      Runtime: python3.12
+      Architectures: [x86_64]
+      MemorySize: 1536
+      Timeout: 900
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref LakeTable
+          TOPIC_ARN: !Ref AlertTopic
+          SITE_BUCKET: !Ref SiteBucket
+          ALERT_CHANGE_PCT: !Ref AlertChangePct
+          CURL_CA_BUNDLE: /etc/pki/tls/certs/ca-bundle.crt
+          GDAL_CACHEMAX: "256"
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref LakeTable }
+        - S3CrudPolicy: { BucketName: !Ref SiteBucket }
+        - SNSPublishMessagePolicy: { TopicName: !GetAtt AlertTopic.TopicName }
+
+  PipelineStateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Name: !Sub "${AWS::StackName}-workflow"
+      Type: STANDARD
+      Policies:
+        - LambdaInvokePolicy: { FunctionName: !Ref PipelineFunction }
+      DefinitionSubstitutions:
+        FunctionArn: !GetAtt PipelineFunction.Arn
+      Definition:
+        Comment: List lakes, process each lake in parallel, then publish data.json.
+        StartAt: ListLakes
+        States:
+          ListLakes:
+            Type: Task
+            Resource: arn:aws:states:::lambda:invoke
+            Parameters:
+              FunctionName: ${FunctionArn}
+              Payload:
+                list_lakes: true
+                options.$: $$.Execution.Input
+            ResultSelector:
+              lakes.$: $.Payload.lakes
+            Next: ProcessEachLake
+          ProcessEachLake:
+            Type: Map
+            ItemsPath: $.lakes
+            MaxConcurrency: 5
+            ItemSelector:
+              lakes.$: States.Array($$.Map.Item.Value)
+              options.$: $$.Execution.Input
+              skip_export: true
+            ItemProcessor:
+              ProcessorConfig: { Mode: INLINE }
+              StartAt: AnalyseLake
+              States:
+                AnalyseLake:
+                  Type: Task
+                  Resource: arn:aws:states:::lambda:invoke
+                  Parameters:
+                    FunctionName: ${FunctionArn}
+                    Payload.$: $
+                  ResultSelector:
+                    result.$: $.Payload
+                  Retry:
+                    - ErrorEquals: [States.ALL]
+                      IntervalSeconds: 20
+                      MaxAttempts: 2
+                      BackoffRate: 2
+                  End: true
+            ResultPath: $.lake_results
+            Next: PublishWebsiteData
+          PublishWebsiteData:
+            Type: Task
+            Resource: arn:aws:states:::lambda:invoke
+            Parameters:
+              FunctionName: ${FunctionArn}
+              Payload:
+                export_only: true
+            ResultSelector:
+              result.$: $.Payload
+            End: true
+      Events:
+        DailyCheck:
+          Type: ScheduleV2
+          Properties:
+            # Sentinel-2 passes over Chennai about every 5 days; a daily check
+            # picks up new scenes soon after they're published.
+            ScheduleExpression: cron(0 9 * * ? *)
+            ScheduleExpressionTimezone: Asia/Kolkata
+            Input: '{"days": 10}'
+
+  # ------------------------------------------------------------ safety nets
+  WorkflowFailedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: The lake watch workflow failed.
+      Namespace: AWS/States
+      MetricName: ExecutionsFailed
+      Dimensions:
+        - Name: StateMachineArn
+          Value: !Ref PipelineStateMachine
+      Statistic: Sum
+      Period: 3600
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+
+  CostBudget:
+    Type: AWS::Budgets::Budget
+    Properties:
+      Budget:
+        BudgetName: !Sub "${AWS::StackName}-monthly"
+        BudgetType: COST
+        TimeUnit: MONTHLY
+        BudgetLimit: { Amount: !Ref MonthlyBudgetUsd, Unit: USD }
+      NotificationsWithSubscribers:
+        - Notification:
+            NotificationType: ACTUAL
+            ComparisonOperator: GREATER_THAN
+            Threshold: 50
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - { SubscriptionType: EMAIL, Address: !Ref AlertEmail }
+        - Notification:
+            NotificationType: FORECASTED
+            ComparisonOperator: GREATER_THAN
+            Threshold: 100
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - { SubscriptionType: EMAIL, Address: !Ref AlertEmail }
+
+Outputs:
+  WebsiteUrl:
+    Description: Your live Lake Watch website
+    Value: !Sub "https://${SiteDistribution.DomainName}"
+  SiteBucketName:
+    Value: !Ref SiteBucket
+  StateMachineArn:
+    Value: !Ref PipelineStateMachine
+  FunctionName:
+    Value: !Ref PipelineFunction
+  TableName:
+    Value: !Ref LakeTable
