@@ -1,0 +1,3 @@
+# boto3 is already included in the Lambda Python runtime.
+rasterio>=1.4,<2
+numpy>=1.26,<3
