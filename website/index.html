@@ -1,0 +1,343 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chennai Lake Watch</title>
+<meta name="description" content="Tracking the water in Chennai's lakes from space with free Sentinel-2 satellite imagery and a serverless AWS pipeline.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,650&family=IBM+Plex+Mono:wght@400;500&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+<style>
+  :root {
+    --bg: #07121c;
+    --panel: #0d1d2b;
+    --panel-2: #12283a;
+    --line: #1f3a50;
+    --text: #e6eef5;
+    --muted: #8fa6b8;
+    --water: #3b9eff;
+    --water-soft: rgba(59, 158, 255, .16);
+    --rise: #34d399;
+    --fall: #fb7185;
+    --sun: #fbbf24;
+    --radius: 14px;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.6 Inter, system-ui, sans-serif; }
+  a { color: var(--water); }
+  .wrap { max-width: 1240px; margin: 0 auto; padding: 0 20px; }
+
+  header { padding: 40px 0 24px; border-bottom: 1px solid var(--line); }
+  .eyebrow { font: 500 12px/1 "IBM Plex Mono", monospace; letter-spacing: .14em; text-transform: uppercase; color: var(--water); }
+  h1 { font: 650 clamp(32px, 5vw, 52px)/1.05 Fraunces, Georgia, serif; margin: 12px 0 10px; letter-spacing: -.01em; }
+  h1 em { font-style: normal; color: var(--water); }
+  .lede { color: var(--muted); max-width: 680px; margin: 0; font-size: 16px; }
+  .meta { margin-top: 16px; display: flex; flex-wrap: wrap; gap: 8px 18px; font: 400 12px/1.4 "IBM Plex Mono", monospace; color: var(--muted); }
+  .meta b { color: var(--text); font-weight: 500; }
+
+  .lakes { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 12px; margin: 24px 0; }
+  .lake { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 14px 16px; cursor: pointer; text-align: left; color: inherit; font: inherit; transition: border-color .15s, background .15s; }
+  .lake:hover { border-color: #2d5675; }
+  .lake[aria-pressed="true"] { border-color: var(--water); background: var(--panel-2); box-shadow: inset 0 0 0 1px var(--water); }
+  .lake .name { font-weight: 600; font-size: 14px; }
+  .lake .area { font: 650 26px/1.1 Fraunces, Georgia, serif; margin: 8px 0 2px; }
+  .lake .area small { font: 400 13px Inter, sans-serif; color: var(--muted); margin-left: 3px; }
+  .lake .sub { font: 400 12px/1.4 "IBM Plex Mono", monospace; color: var(--muted); }
+  .chip { display: inline-block; padding: 1px 7px; border-radius: 99px; font: 500 11px/1.6 "IBM Plex Mono", monospace; }
+  .chip.up { background: rgba(52, 211, 153, .14); color: var(--rise); }
+  .chip.down { background: rgba(251, 113, 133, .14); color: var(--fall); }
+  .chip.flat { background: var(--water-soft); color: var(--muted); }
+
+  .main { display: grid; grid-template-columns: minmax(0, 1.45fr) minmax(0, 1fr); gap: 16px; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; }
+  .card-head { padding: 16px 18px 0; display: flex; justify-content: space-between; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+  .card-head h2 { font: 650 20px/1.2 Fraunces, Georgia, serif; margin: 0; }
+  .card-head .hint { color: var(--muted); font-size: 12px; }
+  #map { height: 480px; margin-top: 14px; background: #0a1824; }
+  .legend { display: flex; gap: 16px; padding: 10px 18px; font-size: 12px; color: var(--muted); border-top: 1px solid var(--line); }
+  .swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 6px; vertical-align: -1px; }
+
+  .timeline { padding: 14px 18px 18px; border-top: 1px solid var(--line); display: grid; grid-template-columns: auto 1fr auto; gap: 14px; align-items: center; }
+  .play { width: 40px; height: 40px; border-radius: 50%; border: 1px solid var(--water); background: var(--water-soft); color: var(--water); cursor: pointer; font-size: 15px; }
+  .play:hover { background: rgba(59, 158, 255, .3); }
+  input[type=range] { width: 100%; accent-color: var(--water); }
+  .readout { font: 500 13px/1.3 "IBM Plex Mono", monospace; text-align: right; min-width: 130px; }
+  .readout span { display: block; color: var(--muted); font-weight: 400; font-size: 11px; }
+
+  .chart-box { padding: 10px 14px 14px; height: 300px; }
+  .stats { display: grid; grid-template-columns: repeat(3, 1fr); border-top: 1px solid var(--line); }
+  .stat { padding: 14px 18px; border-right: 1px solid var(--line); }
+  .stat:last-child { border-right: 0; }
+  .stat .k { font: 400 11px/1.3 "IBM Plex Mono", monospace; color: var(--muted); text-transform: uppercase; letter-spacing: .08em; }
+  .stat .v { font: 650 20px/1.3 Fraunces, Georgia, serif; margin-top: 4px; }
+
+  .empty { padding: 40px 18px; text-align: center; color: var(--muted); }
+  .empty b { color: var(--text); display: block; font-size: 16px; margin-bottom: 6px; }
+
+  section.how { margin: 40px 0 20px; padding-top: 28px; border-top: 1px solid var(--line); }
+  section.how h2 { font: 650 26px/1.2 Fraunces, Georgia, serif; margin: 0 0 6px; }
+  .steps { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-top: 18px; counter-reset: s; }
+  .step { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 16px; }
+  .step::before { counter-increment: s; content: "0" counter(s); font: 500 12px "IBM Plex Mono", monospace; color: var(--water); }
+  .step h3 { margin: 6px 0 6px; font-size: 15px; }
+  .step p { margin: 0; color: var(--muted); font-size: 13px; }
+  .tags { margin-top: 10px; display: flex; flex-wrap: wrap; gap: 6px; }
+  .tag { font: 400 11px/1.6 "IBM Plex Mono", monospace; padding: 1px 8px; border: 1px solid var(--line); border-radius: 99px; color: var(--muted); }
+  footer { padding: 24px 0 40px; color: var(--muted); font-size: 12px; }
+
+  .leaflet-container { font: inherit; }
+  .leaflet-control-attribution { background: rgba(7, 18, 28, .75) !important; color: var(--muted) !important; }
+  .leaflet-control-attribution a { color: var(--muted) !important; }
+
+  @media (max-width: 1000px) {
+    .lakes { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .main { grid-template-columns: 1fr; }
+    .steps { grid-template-columns: repeat(2, 1fr); }
+  }
+  @media (max-width: 560px) {
+    .wrap { padding: 0 16px; }
+    .lakes, .steps { grid-template-columns: 1fr; }
+    #map { height: 360px; }
+    .timeline { grid-template-columns: auto 1fr; }
+    .readout { grid-column: 1 / -1; text-align: left; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <div class="wrap">
+    <div class="eyebrow">Sentinel-2 · NDWI · AWS serverless</div>
+    <h1>Chennai <em>Lake Watch</em></h1>
+    <p class="lede">The water in Chennai's lakes, measured from space. Every few days a satellite passes over the city; this pipeline finds the new images, measures how much of each lake is water, and tracks it over time: monsoon filling, summer shrinkage, and floods.</p>
+    <div class="meta" id="meta"><span>Loading data…</span></div>
+  </div>
+</header>
+
+<main class="wrap">
+  <div class="lakes" id="lakes" role="group" aria-label="Choose a lake"></div>
+
+  <div class="main">
+    <div class="card">
+      <div class="card-head">
+        <h2 id="map-title">Map</h2>
+        <span class="hint">Satellite basemap with the measured water surface on top</span>
+      </div>
+      <div id="map" role="region" aria-label="Map of the selected lake"></div>
+      <div class="legend">
+        <span><i class="swatch" style="background:#2563eb"></i>Water detected</span>
+        <span><i class="swatch" style="background:#a0a0a0"></i>Cloud (not measured)</span>
+        <span><i class="swatch" style="border:1.5px dashed #fbbf24"></i>Measured area</span>
+      </div>
+      <div class="timeline">
+        <button class="play" id="play" aria-label="Play time-lapse">&#9654;</button>
+        <input type="range" id="slider" min="0" max="0" value="0" aria-label="Observation date">
+        <div class="readout" id="readout">–<span>&nbsp;</span></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-head">
+        <h2>Water surface over time</h2>
+        <span class="hint">Click a point to show it on the map</span>
+      </div>
+      <div class="chart-box"><canvas id="chart" aria-label="Water area chart"></canvas></div>
+      <div class="stats">
+        <div class="stat"><div class="k">Largest</div><div class="v" id="s-max">–</div></div>
+        <div class="stat"><div class="k">Smallest</div><div class="v" id="s-min">–</div></div>
+        <div class="stat"><div class="k">Clear scenes</div><div class="v" id="s-n">–</div></div>
+      </div>
+    </div>
+  </div>
+
+  <section class="how">
+    <h2>How it works</h2>
+    <p class="lede">A fully serverless pipeline on AWS, defined as infrastructure as code and running within the free plan.</p>
+    <div class="steps">
+      <div class="step"><h3>Schedule</h3><p>EventBridge Scheduler starts the workflow every morning at 9:00 IST.</p><div class="tags"><span class="tag">EventBridge Scheduler</span><span class="tag">Step Functions</span></div></div>
+      <div class="step"><h3>Find scenes</h3><p>Earth Search, a STAC catalog of the AWS Open Data Registry, returns new Sentinel-2 images over each lake.</p><div class="tags"><span class="tag">AWS Open Data</span><span class="tag">STAC</span></div></div>
+      <div class="step"><h3>Measure water</h3><p>Lambda reads only the lake's pixels from Cloud-Optimized GeoTIFFs, masks clouds, and computes the water index (NDWI).</p><div class="tags"><span class="tag">Lambda</span><span class="tag">rasterio</span><span class="tag">NumPy</span></div></div>
+      <div class="step"><h3>Store and alert</h3><p>Results go to DynamoDB, water maps to S3, and SNS emails when a lake changes sharply.</p><div class="tags"><span class="tag">DynamoDB</span><span class="tag">S3</span><span class="tag">SNS</span><span class="tag">CloudFront</span></div></div>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <div class="wrap">
+    Contains modified Copernicus Sentinel data, accessed via the AWS Registry of Open Data and Element 84 Earth Search. Water areas are estimates from 10 m pixels and can be affected by haze, floating vegetation and the lake outlines used.
+  </div>
+</footer>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<script>
+(function () {
+  const $ = (id) => document.getElementById(id);
+  const fmtDate = (d) => new Date(d + "T00:00:00Z").toLocaleDateString("en-IN", { day: "numeric", month: "short", year: "numeric", timeZone: "UTC" });
+  const km = (v) => v.toFixed(v < 10 ? 2 : 1);
+
+  let data = null, lake = null, idx = 0, overlay = null, rect = null, chart = null, timer = null;
+
+  const map = L.map("map", { zoomControl: true, attributionControl: true }).setView([13.08, 80.1], 10);
+  L.tileLayer("https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}", {
+    maxZoom: 17,
+    attribution: "Imagery &copy; Esri, Maxar, Earthstar Geographics"
+  }).addTo(map);
+
+  fetch("data.json", { cache: "no-cache" })
+    .then((r) => { if (!r.ok) throw new Error(r.status); return r.json(); })
+    .then(init)
+    .catch(() => showEmpty("No data yet", "The first run of the pipeline hasn't finished. Check back in a few minutes."));
+
+  function showEmpty(title, text) {
+    $("meta").innerHTML = "<span>" + title + "</span>";
+    $("lakes").innerHTML = "";
+    document.querySelector(".chart-box").innerHTML = '<div class="empty"><b>' + title + "</b>" + text + "</div>";
+  }
+
+  function change(series) {
+    if (series.length < 2) return null;
+    const a = series[series.length - 2].water_km2, b = series[series.length - 1].water_km2;
+    return a > 0 ? ((b - a) / a) * 100 : null;
+  }
+
+  function init(json) {
+    data = json;
+    const total = data.lakes.reduce((n, l) => n + l.series.length, 0);
+    $("meta").innerHTML =
+      "<span>Lakes <b>" + data.lakes.length + "</b></span>" +
+      "<span>Clear observations <b>" + total + "</b></span>" +
+      "<span>Updated <b>" + new Date(data.generated_at).toLocaleString("en-IN", { dateStyle: "medium", timeStyle: "short" }) + "</b></span>";
+
+    $("lakes").innerHTML = "";
+    data.lakes.forEach((l) => {
+      const last = l.series[l.series.length - 1];
+      const c = change(l.series);
+      const chip = c === null ? "" :
+        '<span class="chip ' + (Math.abs(c) < 2 ? "flat" : c > 0 ? "up" : "down") + '">' + (c > 0 ? "▲ " : c < 0 ? "▼ " : "") + Math.abs(c).toFixed(1) + "%</span>";
+      const b = document.createElement("button");
+      b.className = "lake";
+      b.setAttribute("aria-pressed", "false");
+      b.innerHTML = '<div class="name">' + l.name + "</div>" +
+        (last
+          ? '<div class="area">' + km(last.water_km2) + "<small>km²</small></div>" +
+            '<div class="sub">' + fmtDate(last.date) + " " + chip + "</div>"
+          : '<div class="area">–</div><div class="sub">waiting for a clear image</div>');
+      b.onclick = () => select(l.id);
+      l._button = b;
+      $("lakes").appendChild(b);
+    });
+
+    const first = data.lakes.find((l) => l.series.length) || data.lakes[0];
+    if (first) select(first.id);
+  }
+
+  function select(id) {
+    stop();
+    lake = data.lakes.find((l) => l.id === id);
+    data.lakes.forEach((l) => l._button.setAttribute("aria-pressed", String(l.id === id)));
+    $("map-title").textContent = lake.name;
+
+    const [w, s, e, n] = lake.bbox;
+    if (rect) rect.remove();
+    rect = L.rectangle([[s, w], [n, e]], { color: "#fbbf24", weight: 1.5, dashArray: "6 6", fill: false }).addTo(map);
+    map.fitBounds([[s, w], [n, e]], { padding: [20, 20] });
+
+    const series = lake.series;
+    $("slider").max = Math.max(series.length - 1, 0);
+    $("slider").disabled = series.length < 2;
+    $("play").disabled = series.length < 2;
+
+    if (series.length) {
+      const areas = series.map((p) => p.water_km2);
+      const maxI = areas.indexOf(Math.max(...areas)), minI = areas.indexOf(Math.min(...areas));
+      $("s-max").innerHTML = km(areas[maxI]) + ' <small style="font:400 12px Inter;color:var(--muted)">' + fmtDate(series[maxI].date) + "</small>";
+      $("s-min").innerHTML = km(areas[minI]) + ' <small style="font:400 12px Inter;color:var(--muted)">' + fmtDate(series[minI].date) + "</small>";
+      $("s-n").textContent = series.length;
+    } else {
+      ["s-max", "s-min", "s-n"].forEach((k) => ($(k).textContent = "–"));
+    }
+    drawChart();
+    show(series.length - 1);
+  }
+
+  function show(i) {
+    const series = lake.series;
+    if (overlay) { overlay.remove(); overlay = null; }
+    if (!series.length) {
+      $("readout").innerHTML = "No clear image yet<span>&nbsp;</span>";
+      return;
+    }
+    idx = Math.max(0, Math.min(i, series.length - 1));
+    $("slider").value = idx;
+    const p = series[idx];
+    const [w, s, e, n] = p.mask_bounds || lake.bbox;
+    overlay = L.imageOverlay(p.mask, [[s, w], [n, e]], { opacity: 0.9, interactive: false }).addTo(map);
+    $("readout").innerHTML = km(p.water_km2) + " km²<span>" + fmtDate(p.date) + (p.cloud_pct > 0.5 ? " · " + p.cloud_pct.toFixed(0) + "% cloud" : "") + "</span>";
+    if (chart) {
+      chart.data.datasets[0].pointRadius = series.map((_, j) => (j === idx ? 6 : 2.5));
+      chart.data.datasets[0].pointBackgroundColor = series.map((_, j) => (j === idx ? "#fbbf24" : "#3b9eff"));
+      chart.update("none");
+    }
+  }
+
+  function drawChart() {
+    const box = document.querySelector(".chart-box");
+    if (!box.querySelector("canvas")) box.innerHTML = '<canvas id="chart"></canvas>';
+    if (chart) chart.destroy();
+    const series = lake.series;
+    chart = new Chart($("chart"), {
+      type: "line",
+      data: {
+        labels: series.map((p) => fmtDate(p.date)),
+        datasets: [{
+          data: series.map((p) => p.water_km2),
+          borderColor: "#3b9eff",
+          backgroundColor: "rgba(59,158,255,.12)",
+          fill: true,
+          tension: 0.25,
+          borderWidth: 2,
+          pointRadius: 2.5,
+          pointHoverRadius: 6
+        }]
+      },
+      options: {
+        maintainAspectRatio: false,
+        animation: false,
+        interaction: { mode: "nearest", intersect: false },
+        onClick: (_, els) => { if (els.length) { stop(); show(els[0].index); } },
+        plugins: {
+          legend: { display: false },
+          tooltip: { callbacks: { label: (c) => " " + km(c.parsed.y) + " km² of water" } }
+        },
+        scales: {
+          x: { ticks: { color: "#8fa6b8", maxTicksLimit: 6, maxRotation: 0 }, grid: { color: "rgba(31,58,80,.5)" } },
+          y: { beginAtZero: true, title: { display: true, text: "km²", color: "#8fa6b8" }, ticks: { color: "#8fa6b8" }, grid: { color: "rgba(31,58,80,.5)" } }
+        }
+      }
+    });
+  }
+
+  function stop() {
+    if (timer) clearInterval(timer);
+    timer = null;
+    $("play").innerHTML = "&#9654;";
+    $("play").setAttribute("aria-label", "Play time-lapse");
+  }
+
+  $("slider").addEventListener("input", (e) => { stop(); show(+e.target.value); });
+  $("play").addEventListener("click", () => {
+    if (timer) return stop();
+    if (idx >= lake.series.length - 1) show(0);
+    $("play").innerHTML = "&#10074;&#10074;";
+    $("play").setAttribute("aria-label", "Pause time-lapse");
+    timer = setInterval(() => {
+      if (idx >= lake.series.length - 1) return stop();
+      show(idx + 1);
+    }, 700);
+  });
+})();
+</script>
+</body>
+</html>
